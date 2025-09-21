@@ -1,10 +1,9 @@
 use anyhow::Result;
 use rmcp::{
-    handler::server::tool::{Parameters, ToolRouter},
-    handler::server::wrapper::Json,
+    handler::server::tool::ToolRouter,
+    handler::server::wrapper::{Json, Parameters},
     model::{
-        CallToolResult, Content, ErrorCode, ErrorData as McpError, Implementation, ProtocolVersion,
-        ServerCapabilities, ServerInfo,
+        Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     schemars::JsonSchema,
     serde::{Deserialize, Serialize},
@@ -15,19 +14,22 @@ use rmcp::{
 use tokio::{io::{stdin, stdout}, process::Command};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Return an MCP error (Internal Error) with message and optional data.
-fn mcp_internal(msg: impl Into<String>, data: Option<Value>) -> McpError {
-    McpError::new(ErrorCode::InternalError, msg.into(), data)
+/// Return an error message string with optional JSON data appended.
+fn mcp_internal(msg: impl Into<String>, data: Option<Value>) -> String {
+    match data {
+        Some(d) => format!("{}: {}", msg.into(), d),
+        None => msg.into(),
+    }
 }
 
-/// Return an MCP error (Invalid Params).
-fn mcp_invalid(msg: impl Into<String>) -> McpError {
-    McpError::invalid_params(msg.into(), None)
+/// Return an invalid params error message.
+fn mcp_invalid(msg: impl Into<String>) -> String {
+    msg.into()
 }
 
 /// Run a PowerShell pipeline and parse its JSON output.
 /// The provided `pipeline` should **not** include ConvertTo-Json; we add it with sane depth.
-async fn ps_json(pipeline: &str) -> std::result::Result<Value, McpError> {
+async fn ps_json(pipeline: &str) -> std::result::Result<Value, String> {
     // Wrap the pipeline in a script block so we can set preferences safely.
     let script = format!(
         r#"$ProgressPreference='SilentlyContinue'; try {{ {pipeline} | ConvertTo-Json -Depth 6 }} catch {{ $_ | Out-String }}"#
@@ -63,7 +65,7 @@ async fn ps_json(pipeline: &str) -> std::result::Result<Value, McpError> {
 
 /// Best-effort input sanitization for registry paths to avoid weird injections.
 /// We allow HKLM:\SOFTWARE, HKLM:\SYSTEM, HKCU:\Software only.
-fn validate_registry_path(path: &str) -> std::result::Result<(), McpError> {
+fn validate_registry_path(path: &str) -> std::result::Result<(), String> {
     let path_upper = path.to_ascii_uppercase();
     let allowed = path_upper.starts_with("HKLM:\\SOFTWARE")
         || path_upper.starts_with("HKLM:\\SYSTEM")
@@ -79,6 +81,83 @@ fn validate_registry_path(path: &str) -> std::result::Result<(), McpError> {
     }
     Ok(())
 }
+
+// Parameter types for tools (moved to module scope)
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct UsersParams {
+    #[serde(default)]
+    only_enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct GroupsParams {
+    #[serde(default = "default_true")]
+    include_members: bool,
+}
+fn default_true() -> bool { true }
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct ProgramsParams {
+    #[serde(default)]
+    name_contains: Option<String>,
+    #[serde(default = "def_limit_200")]
+    limit: u32,
+}
+fn def_limit_200() -> u32 { 200 }
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct ServicesParams {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    start_mode: Option<String>,
+    #[serde(default = "def_limit_500")]
+    limit: u32,
+}
+fn def_limit_500() -> u32 { 500 }
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct FirewallParams {
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default = "default_true")]
+    only_enabled: bool,
+    #[serde(default = "def_limit_500")]
+    limit: u32,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct TasksParams {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default = "def_limit_500")]
+    limit: u32,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct PortsParams {
+    #[serde(default = "def_limit_500")]
+    limit: u32,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct EventParams {
+    #[serde(default = "def_system")]
+    log_name: String,
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default = "def_limit_200")]
+    max_events: u32,
+}
+fn def_system() -> String { "System".to_string() }
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct RegParams {
+    path: String,
+    #[serde(default)]
+    names: Vec<String>,
+}
+
 
 #[derive(Clone)]
 pub struct WinBridge {
@@ -97,7 +176,7 @@ impl WinBridge {
 
     /// Basic OS info and uptime (read-only).
     #[tool(name = "os_info", description = "Get OS caption, version, build, architecture, hostname, last boot time, and uptime (hours).", annotations(read_only_hint = true))]
-    async fn os_info(&self) -> std::result::Result<Json<Value>, McpError> {
+    async fn os_info(&self) -> std::result::Result<Json<Value>, String> {
         let ps = r#"
             $os = Get-CimInstance Win32_OperatingSystem;
             [pscustomobject]@{
@@ -115,15 +194,9 @@ impl WinBridge {
 
     // --- Tool: Local users ----------------------------------------------------
 
-    #[derive(Serialize, Deserialize, JsonSchema)]
-    struct UsersParams {
-        /// Only return enabled users.
-        #[serde(default)]
-        only_enabled: bool,
-    }
 
     #[tool(name = "local_users", description = "List local users (Name, Enabled, LastLogon). Optional: only_enabled.", annotations(read_only_hint = true))]
-    async fn local_users(&self, Parameters(p): Parameters<UsersParams>) -> std::result::Result<Json<Value>, McpError> {
+    async fn local_users(&self, Parameters(p): Parameters<UsersParams>) -> std::result::Result<Json<Value>, String> {
         let filter = if p.only_enabled { r"| Where-Object { $_.Enabled }" } else { "" };
         let ps = format!(
             r#"Get-LocalUser | Select-Object Name,Enabled,LastLogon {filter} | Sort-Object Name"#
@@ -133,16 +206,9 @@ impl WinBridge {
 
     // --- Tool: Local groups (with optional members) ---------------------------
 
-    #[derive(Serialize, Deserialize, JsonSchema)]
-    struct GroupsParams {
-        /// Include group members (can be slower). Default: true
-        #[serde(default = "default_true")]
-        include_members: bool,
-    }
-    fn default_true() -> bool { true }
 
     #[tool(name = "local_groups", description = "List local groups. Optionally include members.", annotations(read_only_hint = true))]
-    async fn local_groups(&self, Parameters(p): Parameters<GroupsParams>) -> std::result::Result<Json<Value>, McpError> {
+    async fn local_groups(&self, Parameters(p): Parameters<GroupsParams>) -> std::result::Result<Json<Value>, String> {
         let ps = if p.include_members {
             r#"
             $out = foreach($g in Get-LocalGroup) {
@@ -162,19 +228,9 @@ impl WinBridge {
 
     // --- Tool: Installed programs (registry-based) ---------------------------
 
-    #[derive(Serialize, Deserialize, JsonSchema)]
-    struct ProgramsParams {
-        /// Optional case-insensitive filter on DisplayName
-        #[serde(default)]
-        name_contains: Option<String>,
-        /// Limit results (default 200)
-        #[serde(default = "def_limit_200")]
-        limit: u32,
-    }
-    fn def_limit_200() -> u32 { 200 }
 
     #[tool(name = "installed_programs", description = "List installed programs from registry (DisplayName, Version, Publisher, InstallDate).", annotations(read_only_hint = true))]
-    async fn installed_programs(&self, Parameters(p): Parameters<ProgramsParams>) -> std::result::Result<Json<Value>, McpError> {
+    async fn installed_programs(&self, Parameters(p): Parameters<ProgramsParams>) -> std::result::Result<Json<Value>, String> {
         let mut ps = r#"
           $paths = @(
             'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -201,22 +257,9 @@ impl WinBridge {
 
     // --- Tool: Services -------------------------------------------------------
 
-    #[derive(Serialize, Deserialize, JsonSchema)]
-    struct ServicesParams {
-        /// Filter by State: Running/Stopped (case-insensitive)
-        #[serde(default)]
-        state: Option<String>,
-        /// Filter by StartMode: Auto/Manual/Disabled
-        #[serde(default)]
-        start_mode: Option<String>,
-        /// Limit (default 500)
-        #[serde(default = "def_limit_500")]
-        limit: u32,
-    }
-    fn def_limit_500() -> u32 { 500 }
 
     #[tool(name = "services", description = "List Windows services via CIM (Name, DisplayName, State, StartMode, StartName, PathName).", annotations(read_only_hint = true))]
-    async fn services(&self, Parameters(p): Parameters<ServicesParams>) -> std::result::Result<Json<Value>, McpError> {
+    async fn services(&self, Parameters(p): Parameters<ServicesParams>) -> std::result::Result<Json<Value>, String> {
         let mut ps = r#"
           $svc = Get-CimInstance Win32_Service |
                  Select-Object Name,DisplayName,State,StartMode,StartName,PathName
@@ -235,21 +278,9 @@ impl WinBridge {
 
     // --- Tool: Firewall rules (summary) --------------------------------------
 
-    #[derive(Serialize, Deserialize, JsonSchema)]
-    struct FirewallParams {
-        /// Inbound/Outbound
-        #[serde(default)]
-        direction: Option<String>,
-        /// Only enabled rules (default true)
-        #[serde(default = "default_true")]
-        only_enabled: bool,
-        /// Limit (default 500)
-        #[serde(default = "def_limit_500")]
-        limit: u32,
-    }
 
     #[tool(name = "firewall_rules", description = "List Windows Firewall rules (DisplayName, Enabled, Direction, Action, Profile).", annotations(read_only_hint = true))]
-    async fn firewall_rules(&self, Parameters(p): Parameters<FirewallParams>) -> std::result::Result<Json<Value>, McpError> {
+    async fn firewall_rules(&self, Parameters(p): Parameters<FirewallParams>) -> std::result::Result<Json<Value>, String> {
         let mut ps = r#"
           $rules = Get-NetFirewallRule |
                    Select-Object DisplayName,Enabled,Direction,Action,Profile
@@ -267,18 +298,9 @@ impl WinBridge {
 
     // --- Tool: Scheduled tasks ------------------------------------------------
 
-    #[derive(Serialize, Deserialize, JsonSchema)]
-    struct TasksParams {
-        /// Filter by State (e.g., Ready, Running, Disabled)
-        #[serde(default)]
-        state: Option<String>,
-        /// Limit (default 500)
-        #[serde(default = "def_limit_500")]
-        limit: u32,
-    }
 
     #[tool(name = "scheduled_tasks", description = "List scheduled tasks with last/next run time.", annotations(read_only_hint = true))]
-    async fn scheduled_tasks(&self, Parameters(p): Parameters<TasksParams>) -> std::result::Result<Json<Value>, McpError> {
+    async fn scheduled_tasks(&self, Parameters(p): Parameters<TasksParams>) -> std::result::Result<Json<Value>, String> {
         let mut ps = r#"
           $tasks = Get-ScheduledTask
           $out = foreach($t in $tasks) {
@@ -304,7 +326,7 @@ impl WinBridge {
     // --- Tool: SMB shares -----------------------------------------------------
 
     #[tool(name = "shares", description = "List SMB shares (Name, Path, Description, FolderEnumerationMode, EncryptData).", annotations(read_only_hint = true))]
-    async fn shares(&self) -> std::result::Result<Json<Value>, McpError> {
+    async fn shares(&self) -> std::result::Result<Json<Value>, String> {
         let ps = r#"Get-SmbShare | Select-Object Name,Path,Description,FolderEnumerationMode,EncryptData | Sort-Object Name"#;
         Ok(Json(ps_json(ps).await?))
     }
@@ -312,7 +334,7 @@ impl WinBridge {
     // --- Tool: Network configuration -----------------------------------------
 
     #[tool(name = "network_config", description = "Per-adapter IPv4/IPv6 and DNS server configuration.", annotations(read_only_hint = true))]
-    async fn network_config(&self) -> std::result::Result<Json<Value>, McpError> {
+    async fn network_config(&self) -> std::result::Result<Json<Value>, String> {
         let ps = r#"
           Get-NetIPConfiguration | ForEach-Object {
             [pscustomobject]@{
@@ -329,22 +351,16 @@ impl WinBridge {
     // --- Tool: Hotfixes (installed updates) ----------------------------------
 
     #[tool(name = "hotfixes", description = "List installed hotfixes (KBs) via Get-HotFix.", annotations(read_only_hint = true))]
-    async fn hotfixes(&self) -> std::result::Result<Json<Value>, McpError> {
+    async fn hotfixes(&self) -> std::result::Result<Json<Value>, String> {
         let ps = r#"Get-HotFix | Select-Object HotFixID,Description,InstalledOn | Sort-Object InstalledOn -Descending"#;
         Ok(Json(ps_json(ps).await?))
     }
 
     // --- Tool: Open ports (listening TCP) ------------------------------------
 
-    #[derive(Serialize, Deserialize, JsonSchema)]
-    struct PortsParams {
-        /// Limit (default 500)
-        #[serde(default = "def_limit_500")]
-        limit: u32,
-    }
 
     #[tool(name = "open_ports", description = "List listening TCP ports with owning process.", annotations(read_only_hint = true))]
-    async fn open_ports(&self, Parameters(p): Parameters<PortsParams>) -> std::result::Result<Json<Value>, McpError> {
+    async fn open_ports(&self, Parameters(p): Parameters<PortsParams>) -> std::result::Result<Json<Value>, String> {
         let ps = format!(
             r#"
             $rows = Get-NetTCPConnection -State Listen |
@@ -368,22 +384,9 @@ impl WinBridge {
 
     // --- Tool: Event log (recent) --------------------------------------------
 
-    #[derive(Serialize, Deserialize, JsonSchema)]
-    struct EventParams {
-        /// Log name (e.g., System, Security, Application). Default: System
-        #[serde(default = "def_system")]
-        log_name: String,
-        /// Level filter (e.g., Error, Warning, Information, Critical)
-        #[serde(default)]
-        level: Option<String>,
-        /// Maximum events (default 200)
-        #[serde(default = "def_limit_200")]
-        max_events: u32,
-    }
-    fn def_system() -> String { "System".to_string() }
 
     #[tool(name = "event_log_recent", description = "Return recent events from a Windows event log with optional level filter.", annotations(read_only_hint = true))]
-    async fn event_log_recent(&self, Parameters(p): Parameters<EventParams>) -> std::result::Result<Json<Value>, McpError> {
+    async fn event_log_recent(&self, Parameters(p): Parameters<EventParams>) -> std::result::Result<Json<Value>, String> {
         let mut ps = format!(
             r#"$ev = Get-WinEvent -LogName "{log}" -MaxEvents {n} | Select-Object TimeCreated,Id,LevelDisplayName,ProviderName,Message"#,
             log = p.log_name.replace('"', "`\""),
@@ -399,17 +402,9 @@ impl WinBridge {
 
     // --- Tool: Read registry key (restricted roots) ---------------------------
 
-    #[derive(Serialize, Deserialize, JsonSchema)]
-    struct RegParams {
-        /// Registry path (HKLM:\SOFTWARE..., HKLM:\SYSTEM..., HKCU:\Software...)
-        path: String,
-        /// Optional specific value names to return. If empty, return all properties.
-        #[serde(default)]
-        names: Vec<String>,
-    }
 
     #[tool(name = "read_registry_key", description = "Read a registry key (restricted to HKLM:\\SOFTWARE, HKLM:\\SYSTEM, HKCU:\\Software).", annotations(read_only_hint = true))]
-    async fn read_registry_key(&self, Parameters(p): Parameters<RegParams>) -> std::result::Result<Json<Value>, McpError> {
+    async fn read_registry_key(&self, Parameters(p): Parameters<RegParams>) -> std::result::Result<Json<Value>, String> {
         validate_registry_path(&p.path)?;
         let names_arr = if p.names.is_empty() {
             String::from("$null")
