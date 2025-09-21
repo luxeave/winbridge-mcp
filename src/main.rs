@@ -8,10 +8,16 @@ use rmcp::{
     schemars::JsonSchema,
     serde::{Deserialize, Serialize},
     serde_json::{json, Value},
-    service::ServiceExt,
     tool, tool_handler, tool_router, ServerHandler,
 };
-use tokio::{io::{stdin, stdout}, process::Command};
+
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpService,
+    session::local::LocalSessionManager
+};
+use axum::Router;
+
+use tokio::{process::Command};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Return an error message string with optional JSON data appended.
@@ -456,18 +462,26 @@ impl ServerHandler for WinBridge {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Logging setup (control with RUST_LOG, e.g., RUST_LOG=info)
+async fn main() -> anyhow::Result<()> {
+    // logging (unchanged)
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // stdio transport per MCP spec; host spawns this process.
-    let transport = (stdin(), stdout());
+    // Create the MCP HTTP service; each new session builds a fresh WinBridge
+    let service = StreamableHttpService::new(
+        || Ok(WinBridge::new()),
+        LocalSessionManager::default().into(),
+        Default::default(), // keep-alive SSE, stateful sessions enabled
+    );
 
-    // Serve; blocks until the peer disconnects.
-    let service = WinBridge::new().serve(transport).await?;
-    service.waiting().await?;
+    // Mount on /mcp and listen on all interfaces, port 3000
+    let app = Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })
+        .await?;
+
     Ok(())
 }
